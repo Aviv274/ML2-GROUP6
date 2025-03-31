@@ -80,6 +80,7 @@ Day X: Title of the Day
                         ]
                         response = chat.invoke(messages)
                         st.session_state.chat_history.append(("AI", response.content))
+                        st.session_state.itinerary_text = response.content
                         st.session_state.trip_generated = True
                         st.rerun()
 
@@ -87,27 +88,27 @@ Day X: Title of the Day
 if st.session_state.get("trip_generated"):
 
     st.markdown("### 📋 Initial Trip Plan")
-    if len(st.session_state.chat_history) > 1:
-        def parse_itinerary(text):
-            itinerary = []
-            current_day = None
-            for line in text.split("\n"):
-                day_match = re.match(r"Day (\d+):? ?(.*)?", line.strip())
-                activity_match = re.match(r"\[(\d{1,2}:\d{2})\] (.*?) \| Status: (.*)", line.strip())
-                if day_match:
-                    current_day = {"day": f"Day {day_match.group(1)}", "title": day_match.group(2), "activities": []}
-                    itinerary.append(current_day)
-                elif activity_match and current_day:
-                    current_day["activities"].append({
-                        "time": activity_match.group(1),
-                        "desc": activity_match.group(2),
-                        "status": activity_match.group(3)
-                    })
-            return itinerary
+    def parse_itinerary(text):
+        itinerary = []
+        current_day = None
+        for line in text.split("\n"):
+            day_match = re.match(r"Day (\d+):? ?(.*)?", line.strip())
+            activity_match = re.match(r"\[(\d{1,2}:\d{2})\] (.*?) \| Status: (.*)", line.strip())
+            if day_match:
+                current_day = {"day": f"Day {day_match.group(1)}", "title": day_match.group(2), "activities": []}
+                itinerary.append(current_day)
+            elif activity_match and current_day:
+                current_day["activities"].append({
+                    "time": activity_match.group(1),
+                    "desc": activity_match.group(2),
+                    "status": activity_match.group(3)
+                })
+        return itinerary
 
     st.markdown("### 💬 Chat with Your AI Travel Agent")
     for speaker, msg in st.session_state.chat_history[1:]:
         if speaker == "AI" and msg.startswith("Day"):
+            st.session_state.itinerary_text = msg
             itinerary = parse_itinerary(msg)
             for day in itinerary:
                 bubble_style = "background-color:rgba(240,240,240,0.7); color:#333; padding:10px; border-radius:10px; margin:5px;"
@@ -119,10 +120,7 @@ if st.session_state.get("trip_generated"):
                 st.markdown(table_md)
                 st.markdown("</div>", unsafe_allow_html=True)
         else:
-            if speaker == "User":
-                bubble_style = "background-color:rgba(224,247,250,0.7); color:#000;"
-            else:
-                bubble_style = "background-color:rgba(240,240,240,0.7); color:#000;"
+            bubble_style = "background-color:rgba(224,247,250,0.7); color:#000;" if speaker == "User" else "background-color:rgba(240,240,240,0.7); color:#000;"
             st.markdown(f"<div style='{bubble_style} padding:10px; border-radius:10px; margin:5px;'>{msg}</div>", unsafe_allow_html=True)
 
     followup = st.chat_input("Ask to adjust your trip:")
@@ -135,8 +133,8 @@ if st.session_state.get("trip_generated"):
             ]
             response = chat.invoke(messages)
             st.session_state.chat_history.append(("AI", response.content))
+            st.session_state.itinerary_text = response.content
             st.rerun()
-
 
     st.markdown("---")
     st.markdown("### 📄 Download Your Itinerary as PDF")
@@ -158,23 +156,6 @@ if st.session_state.get("trip_generated"):
                 text = text.replace(bad, good)
             return text
 
-        def parse_itinerary(text):
-            itinerary = []
-            current_day = None
-            for line in text.split("\n"):
-                day_match = re.match(r"Day (\d+):? ?(.*)?", line.strip())
-                activity_match = re.match(r"\[(\d{1,2}:\d{2})\] (.*?) \| Status: (.*)", line.strip())
-                if day_match:
-                    current_day = {"day": f"Day {day_match.group(1)}", "title": day_match.group(2), "activities": []}
-                    itinerary.append(current_day)
-                elif activity_match and current_day:
-                    current_day["activities"].append({
-                        "time": activity_match.group(1),
-                        "desc": activity_match.group(2),
-                        "status": activity_match.group(3)
-                    })
-            return itinerary
-
         def status_color(status):
             return {
                 "Done": (200, 255, 200),
@@ -182,15 +163,13 @@ if st.session_state.get("trip_generated"):
                 "Not Yet Started": (255, 220, 220)
             }.get(status, (240, 240, 240))
 
-        itinerary_text = st.session_state.chat_history[1][1]
         itinerary = parse_itinerary(st.session_state.itinerary_text)
         pdf = PDF()
         pdf.set_auto_page_break(auto=True, margin=15)
         pdf.set_font("Helvetica", size=12)
 
-
         for day in itinerary:
-            pdf.add_page()  # Start each day on a new page
+            pdf.add_page()
             pdf.set_font("Helvetica", "B", 14)
             pdf.set_text_color(0)
             pdf.cell(0, 10, clean_text(f"{day['day']}: {day['title']}"), ln=True)
@@ -210,7 +189,6 @@ if st.session_state.get("trip_generated"):
                 line_height = 7
                 col_widths = [40, 100, 50]
 
-                # Use dummy PDF to calculate height
                 dummy = FPDF()
                 dummy.add_page()
                 dummy.set_font("Helvetica", size=12)
