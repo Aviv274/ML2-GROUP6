@@ -183,8 +183,6 @@ if st.session_state.get("trip_generated"):
             }.get(status, (240, 240, 240))
 
         itinerary_text = st.session_state.chat_history[1][1]
-        itinerary = parse_itinerary(itinerary_text)
-
         itinerary = parse_itinerary(st.session_state.itinerary_text)
         pdf = PDF()
         pdf.set_auto_page_break(auto=True, margin=15)
