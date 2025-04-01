@@ -1,223 +1,272 @@
 import streamlit as st
 import os
 from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, AIMessage
-from datetime import date
-from urllib.parse import quote_plus
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
+from typing import Annotated, TypedDict
+import datetime
+import operator
 from io import BytesIO
 from fpdf import FPDF
 import re
+from hotel_tool import hotels_finder, HotelsInput
+from flight_tool import flights_finder, FlightsInput
+import json
+
 
 # Load environment variables
 load_dotenv()
 
+# Constants
+CURRENT_YEAR = datetime.datetime.now().year
+
+# App config
 st.set_page_config(page_title="AI Travel Agent", page_icon="🌍", layout="wide")
 st.title("🌍 AI Travel Agent")
 
-# Session state
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "show_form_panel" not in st.session_state:
-    st.session_state.show_form_panel = True
+# Define agent state
+class AgentState(TypedDict):
+    messages: Annotated[list, operator.add]
 
-# Model
-chat = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
-    temperature=0.9,
-    google_api_key=os.getenv("GOOGLE_API_KEY")
-)
+# System prompt with DETAILED example tool call
+TOOLS_SYSTEM_PROMPT = f"""You are a smart travel agency. Use the tools to look up information.
+You are allowed to make multiple calls (either together or in sequence).
+Only look up information when you are sure of what you want.
+The current year is {CURRENT_YEAR}.
 
-# Sidebar
+In your output always include:
+- name and rating of the hotel
+- price per night and total cost (with currency symbol, e.g., €84 per night, €337 total)
+- and a link if possible
+- for flights: airline name, price, departure and arrival airports, departure and arrival times, and a booking link
+
+Before the day-by-day itinerary, always show a short summary of the chosen hotel and chosen flight(s), including all relevant information.
+
+Return your results in this markdown table format, per day:
+**Day X: Title**
+| Time | Activity | Status |
+|------|----------|--------|
+| 09:00 | Visit the Louvre Museum | Not Yet Started |
+| 14:00 | Lunch at Café de Flore | Not Yet Started |
+
+Use 24-hour format (e.g., 14:00) for all times.
+Do not use "General" in the itinerary table. Always include a real time, even for flights and hotel check-ins. If the time is flexible or unknown, make a reasonable estimate (e.g., 14:00 for check-in).
+Only include "General" as time row for hotel or flight or similar overall items.
+
+Adjust the travel itinerary to start only after the flight's landing time, and begin near the arrival airport.
+
+Always plan to arrive at the airport **at least 3 hours before any international flight departure**. Adjust the itinerary accordingly to allow for enough travel and check-in time.
+
+Always generate a rich, full itinerary that includes specific recommended places to visit, eat and enjoy.
+Use famous, popular, or hidden gem recommendations in the area of the hotel or arrival airport.
+
+Do not be vague. For example, instead of:
+"Visit a Parisian landmark" → say "Visit the Eiffel Tower"
+"Explore nightlife" → say "Have a drink at Little Red Door, one of Paris’ top speakeasies"
+
+Your output must feel like a personal guide built by a local expert, not a generic outline.
+If you need to look up some information before asking a follow up question, you are allowed to do that!
+I want to have in your output links to hotels or flights websites (if possible).
+
+Use the following logic for hotel_class selection based on budget:
+- Low budget: hotel_class = "1,2"
+- Medium budget: hotel_class = "3,4"
+- High budget: hotel_class = "5"
+
+Example Tool Calls:
+
+hotels_finder({{
+    "q": "Paris",
+    "check_in_date": "2024-07-01",
+    "check_out_date": "2024-07-05",
+    "adults": 2,
+    "children": 1,
+    "rooms": 1,
+    "hotel_class": "3,4",
+    "sort_by": 8
+}})
+
+flights_finder({{
+    "departure_airport": "JFK",
+    "arrival_airport": "CDG",
+    "outbound_date": "2024-07-01",
+    "return_date": "2024-07-05",
+    "adults": 2,
+    "children": 0
+}})
+
+When booking flights, automatically determine the closest major airport to a given city using a predefined mapping (e.g., Paris → CDG, Madrid → MAD). Do not ask the user for airport codes. If the city is not in the mapping, make a reasonable assumption based on well-known airport locations.
+
+Please include complete flight information — both outbound (origin to destination) and return (destination to origin) segments.
+"""
+
+
+# Define agent tools
+TOOLS = [hotels_finder,flights_finder]
+
+# Build the agent class
+class Agent:
+    def __init__(self):
+        self._tools = {t.name: t for t in TOOLS}
+        self._tools_llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            temperature=0.7,
+            google_api_key=os.getenv("GOOGLE_API_KEY")
+        ).bind_tools(TOOLS)
+
+        builder = StateGraph(AgentState)
+        builder.add_node("call_tools_llm", self.call_tools_llm)
+        builder.add_node("invoke_tools", self.invoke_tools)
+        builder.set_entry_point("call_tools_llm")
+
+        builder.add_conditional_edges("call_tools_llm", self.exists_action, {
+            "more_tools": "invoke_tools",
+            "end": END
+        })
+        builder.add_edge("invoke_tools", "call_tools_llm")
+
+        memory = MemorySaver()
+        self.graph = builder.compile(checkpointer=memory)
+
+    def exists_action(self, state: AgentState):
+        result = state["messages"][-1]
+        if hasattr(result, "tool_calls") and len(result.tool_calls) > 0:
+            return "more_tools"
+        return "end"
+
+    def call_tools_llm(self, state: AgentState):
+        messages = [SystemMessage(content=TOOLS_SYSTEM_PROMPT)] + state["messages"]
+        message = self._tools_llm.invoke(messages)
+        return {"messages": [message]}
+
+    def invoke_tools(self, state: AgentState):
+        tool_calls = state["messages"][-1].tool_calls
+        results = []
+        for t in tool_calls:
+            if t["name"] not in self._tools:
+                result = "Invalid tool"
+            else:
+                args = t.get("args", {})
+
+                try:
+                    if t["name"] == "hotels_finder":
+                        if "q" not in args:
+                            args["q"] = st.session_state.get("destination", "")
+                        if "check_in_date" not in args:
+                            args["check_in_date"] = str(st.session_state.get("start_date", datetime.date.today()))
+                        if "check_out_date" not in args:
+                            args["check_out_date"] = str(st.session_state.get("end_date", datetime.date.today()))
+                        if "adults" not in args:
+                            args["adults"] = 2
+                        if "hotel_class" not in args:
+                            budget = st.session_state.get("budget", "Medium").lower()
+                            if budget == "low":
+                                args["hotel_class"] = "1,2"
+                            elif budget == "medium":
+                                args["hotel_class"] = "3,4"
+                            elif budget == "high":
+                                args["hotel_class"] = "5"
+                        if "sort_by" not in args:
+                            budget = st.session_state.get("budget", "Medium").lower()
+                            args["sort_by"] = "3" if budget == "low" else "8"
+
+                        parsed_args = HotelsInput(**args)
+
+                    elif t["name"] == "flights_finder":
+                        with open("cities_iata.json", "r", encoding="utf-8") as f:
+                            cities_iata = json.load(f)
+                        
+                        if "departure_airport" not in args:
+                            args["departure_airport"] = cities_iata.get(st.session_state.get("origin", "").lower())
+                        if "arrival_airport" not in args:
+                            args["arrival_airport"] = cities_iata.get(st.session_state.get("destination", "").lower())
+                        if "outbound_date" not in args:
+                            args["outbound_date"] = str(st.session_state.get("start_date", datetime.date.today()))
+                        if "return_date" not in args:
+                            args["return_date"] = str(st.session_state.get("end_date", datetime.date.today()))
+                        if "adults" not in args:
+                            args["adults"] = st.session_state.get("adult", 1)
+                        if "children" not in args:
+                            args["children"] = st.session_state.get("children", 0)
+
+
+                        parsed_args = FlightsInput(**args)
+
+                    else:
+                        result = "Unsupported tool"
+                        results.append(ToolMessage(tool_call_id=t["id"], name=t["name"], content=str(result)))
+                        continue
+
+                    result = self._tools[t["name"].strip()].invoke({"params": parsed_args})
+
+                except Exception as e:
+                    result = f"Tool call failed: {e}"
+
+            results.append(ToolMessage(tool_call_id=t["id"], name=t["name"], content=str(result)))
+        return {"messages": results}
+
+# Instantiate the agent
+agent = Agent()
+
+# Sidebar preferences form
 with st.sidebar:
-    if st.button("🧾 Toggle Travel Preferences Panel"):
-        st.session_state.show_form_panel = not st.session_state.show_form_panel
-
-    if st.session_state.show_form_panel:
-        st.header("🧾 Travel Preferences")
-
-        if "trip_generated" not in st.session_state:
-            destination = st.text_input("Where would you like to travel?")
-            start_date = st.date_input("Start date", date.today())
-            end_date = st.date_input("End date", date.today())
-            budget = st.selectbox("What is your budget level?", ["Low", "Medium", "High"])
-            interests = st.text_area("Main interests (e.g., food, museums, nature, nightlife)")
-            avoid = st.text_input("Anything to avoid?")
-
-            if st.button("🧽 Generate Trip Plan"):
-                if not destination or not interests:
-                    st.warning("Please fill out at least the destination and interests.")
-                else:
-                    with st.spinner("Generating your custom itinerary..."):
-                        st.session_state.destination = destination
-                        st.session_state.start_date = start_date
-                        st.session_state.end_date = end_date
-                        st.session_state.budget = budget
-                        st.session_state.interests = interests
-                        st.session_state.avoid = avoid
-
-                        trip_days = (end_date - start_date).days + 1
-                        prompt = f"""
-You are a smart travel planner that generates personalized travel itineraries.
-
-Create a personalized day-by-day travel itinerary:
+    st.header("📂 Travel Preferences")
+    origin = st.text_input("From where would you like to travel?")
+    destination = st.text_input("Where would you like to travel?")
+    start_date = st.date_input("Start date", datetime.date.today())
+    end_date = st.date_input("End date", datetime.date.today())
+    budget = st.selectbox("What is your budget level?", ["Low", "Medium", "High"])
+    interests = st.text_area("Main interests (e.g., food, museums, nature, nightlife)")
+    avoid = st.text_input("Anything to avoid?")
+    adult = st.number_input("Number of adult", min_value=0, value=1)
+    children = st.number_input("Number of children", min_value=0, value=0)
+    if st.button("🧽 Generate Trip Plan"):
+        user_message = f"""
+Create a personalized itinerary.
+origin: {origin}
 Destination: {destination}
-Trip Duration: {trip_days} days
 Start Date: {start_date}
 End Date: {end_date}
-Budget Level: {budget}
+Budget: {budget}
 Interests: {interests}
-Things to Avoid: {avoid}
-
-Use the following format strictly for each day:
-Day X: Title of the Day
-[HH:MM] Activity description | Status: Done/In Progress/Not Yet Started
+Avoid: {avoid}
+children: {children}
+adult: {adult}
 """
-                        st.session_state.chat_history.append(("User", prompt))
-                        messages = [
-                            HumanMessage(content=msg) if role == "User" else AIMessage(content=msg)
-                            for role, msg in st.session_state.chat_history
-                        ]
-                        response = chat.invoke(messages)
-                        st.session_state.chat_history.append(("AI", response.content))
-                        st.session_state.itinerary_text = response.content
-                        st.session_state.trip_generated = True
-                        st.rerun()
+        st.session_state.user_prompt = user_message
+        st.session_state.origin = origin
+        st.session_state.destination = destination
+        st.session_state.start_date = start_date
+        st.session_state.end_date = end_date
+        st.session_state.adult = adult
+        st.session_state.chat_history = [HumanMessage(content=user_message)]
+        st.rerun()
 
-# Display itinerary
-if st.session_state.get("trip_generated"):
-
-    st.markdown("### 📋 Initial Trip Plan")
-    def parse_itinerary(text):
-        itinerary = []
-        current_day = None
-        for line in text.split("\n"):
-            day_match = re.match(r"Day (\d+):? ?(.*)?", line.strip())
-            activity_match = re.match(r"\[(\d{1,2}:\d{2})\] (.*?) \| Status: (.*)", line.strip())
-            if day_match:
-                current_day = {"day": f"Day {day_match.group(1)}", "title": day_match.group(2), "activities": []}
-                itinerary.append(current_day)
-            elif activity_match and current_day:
-                current_day["activities"].append({
-                    "time": activity_match.group(1),
-                    "desc": activity_match.group(2),
-                    "status": activity_match.group(3)
-                })
-        return itinerary
+# Run agent if user_prompt exists
+if "user_prompt" in st.session_state:
+    with st.spinner("Planning your trip..."):
+        valid_messages = [msg for msg in st.session_state.chat_history if getattr(msg, "content", "").strip()]
+        if valid_messages:
+            events = agent.graph.invoke(
+                {"messages": valid_messages},
+                config={"thread_id": "travel_agent_session"}
+            )
+            response = events["messages"][-1]
+            st.session_state.chat_history.append(response)
+        else:
+            st.warning("Please enter a valid message before generating the trip plan.")
 
     st.markdown("### 💬 Chat with Your AI Travel Agent")
-    for speaker, msg in st.session_state.chat_history[1:]:
-        if speaker == "AI" and msg.startswith("Day"):
-            st.session_state.itinerary_text = msg
-            itinerary = parse_itinerary(msg)
-            for day in itinerary:
-                bubble_style = "background-color:rgba(240,240,240,0.7); color:#333; padding:10px; border-radius:10px; margin:5px;"
-                st.markdown(f"<div style='{bubble_style}'>", unsafe_allow_html=True)
-                st.markdown(f"**{day['day']}: {day['title']}**")
-                table_md = "| Time | Activity | Status |\n|------|----------|--------|"
-                for act in day["activities"]:
-                    table_md += f"\n| {act['time']} | {act['desc']} | {act['status']} |"
-                st.markdown(table_md)
-                st.markdown("</div>", unsafe_allow_html=True)
+    for msg in st.session_state.chat_history:
+        if isinstance(msg, HumanMessage):
+            bubble_style = "background-color:rgba(224,247,250,0.7); color:#000;"
         else:
-            bubble_style = "background-color:rgba(224,247,250,0.7); color:#000;" if speaker == "User" else "background-color:rgba(240,240,240,0.7); color:#000;"
-            st.markdown(f"<div style='{bubble_style} padding:10px; border-radius:10px; margin:5px;'>{msg}</div>", unsafe_allow_html=True)
+            bubble_style = "background-color:rgba(240,240,240,0.7); color:#000;"
+        st.markdown(f"<div style='{bubble_style} padding:10px; border-radius:10px; margin:5px;'>{msg.content}</div>", unsafe_allow_html=True)
 
-    followup = st.chat_input("Ask to adjust your trip:")
-    if followup:
-        with st.spinner("Updating your itinerary..."):
-            st.session_state.chat_history.append(("User", followup))
-            messages = [
-                HumanMessage(content=msg) if role == "User" else AIMessage(content=msg)
-                for role, msg in st.session_state.chat_history
-            ]
-            response = chat.invoke(messages)
-            st.session_state.chat_history.append(("AI", response.content))
-            st.session_state.itinerary_text = response.content
-            st.rerun()
-
-    st.markdown("---")
-    st.markdown("### 📄 Download Your Itinerary as PDF")
-    if st.button("⬇️ Download PDF"):
-
-        class PDF(FPDF):
-            def header(self):
-                self.set_font("Helvetica", "B", 16)
-                self.set_text_color(0, 102, 204)
-                self.cell(0, 10, "Daily Itinerary", ln=True, align="C")
-                self.ln(5)
-
-        def clean_text(text):
-            replacements = {
-                "–": "-", "—": "-", "“": '"', "”": '"', "‘": "'", "’": "'",
-                "•": "*", "…": "...", "é": "e", "á": "a", "œ": "oe"
-            }
-            for bad, good in replacements.items():
-                text = text.replace(bad, good)
-            return text
-
-        def status_color(status):
-            return {
-                "Done": (200, 255, 200),
-                "In Progress": (255, 255, 180),
-                "Not Yet Started": (255, 220, 220)
-            }.get(status, (240, 240, 240))
-
-        itinerary = parse_itinerary(st.session_state.itinerary_text)
-        pdf = PDF()
-        pdf.set_auto_page_break(auto=True, margin=15)
-        pdf.set_font("Helvetica", size=12)
-
-        for day in itinerary:
-            pdf.add_page()
-            pdf.set_font("Helvetica", "B", 14)
-            pdf.set_text_color(0)
-            pdf.cell(0, 10, clean_text(f"{day['day']}: {day['title']}"), ln=True)
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.set_fill_color(200, 200, 200)
-            pdf.cell(40, 10, "Time", border=1, fill=True)
-            pdf.cell(100, 10, "Activity", border=1, fill=True)
-            pdf.cell(50, 10, "Status", border=1, ln=True, fill=True)
-            pdf.set_font("Helvetica", size=12)
-
-            for act in day["activities"]:
-                r, g, b = status_color(act["status"])
-                pdf.set_fill_color(r, g, b)
-
-                x = pdf.get_x()
-                y = pdf.get_y()
-                line_height = 7
-                col_widths = [40, 100, 50]
-
-                dummy = FPDF()
-                dummy.add_page()
-                dummy.set_font("Helvetica", size=12)
-                time_lines = dummy.multi_cell(col_widths[0], line_height, clean_text(act["time"]), split_only=True)
-                desc_lines = dummy.multi_cell(col_widths[1], line_height, clean_text(act["desc"]), split_only=True)
-                status_lines = dummy.multi_cell(col_widths[2], line_height, clean_text(act["status"]), split_only=True)
-                max_lines = max(len(time_lines), len(desc_lines), len(status_lines))
-                row_height = max_lines * line_height
-
-                pdf.set_xy(x, y)
-                pdf.cell(col_widths[0], row_height, clean_text(act["time"]), border=1, fill=True)
-                pdf.set_xy(x + col_widths[0], y)
-                pdf.multi_cell(col_widths[1], line_height, clean_text(act["desc"]), border=1, fill=True)
-                y_after_desc = pdf.get_y()
-                pdf.set_xy(x + col_widths[0] + col_widths[1], y)
-                pdf.cell(col_widths[2], row_height, clean_text(act["status"]), border=1, fill=True)
-                pdf.set_y(max(y_after_desc, y + row_height))
-
-            pdf.ln(5)
-
-        output = pdf.output(dest="S")
-        if isinstance(output, str):
-            output = output.encode("latin1")
-        buffer = BytesIO(output)
-        buffer.seek(0)
-
-        st.download_button(
-            label="Download Itinerary PDF",
-            data=buffer,
-            file_name="trip_itinerary.pdf",
-            mime="application/pdf"
-        )
+    user_input = st.chat_input("Ask to adjust your trip:")
+    if user_input and user_input.strip():
+        st.session_state.chat_history.append(HumanMessage(content=user_input))
+        st.rerun()

@@ -1,6 +1,9 @@
 fpdf==1.7.2
 fpdf2==2.8.2
+langchain==0.3.22
 langchain_core==0.3.49
 langchain_google_genai==2.1.2
+langgraph==0.3.22
 python-dotenv==1.1.0
+serpapi==0.1.5
 streamlit==1.41.1
