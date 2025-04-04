@@ -170,7 +170,7 @@ adult: {adult}
         st.session_state.chat_history = [HumanMessage(content=user_message)]
         st.rerun()
 
-        #st.session_state.show_form = False
+        st.session_state.show_form = False
 
 
 
