@@ -86,10 +86,24 @@ IMPORTANT: You must return **only valid JSON** in your response. Do not include 
     "rating": 4.5
   }},
   "flight": {{
-    "departure_time": "10:15 AM",
-    "arrival_time": "10:15 AM",
-    "nonstop": true,
-    "price": "$1200"
+  "outbound": {{
+    "airline": "Air France",
+    "departure_time": "10:15",
+    "arrival_time": "14:30",
+    "departure_airport": "JFK",
+    "arrival_airport": "CDG",
+    "price": "$600",
+    "link": "https://booking.airfrance.com"
+  }},
+  "return": {{
+    "airline": "Air France",
+    "departure_time": "12:00",
+    "arrival_time": "15:45",
+    "departure_airport": "CDG",
+    "arrival_airport": "JFK",
+    "price": "$580",
+    "link": "https://booking.airfrance.com"
+  }}
   }},
   "plan": [
     {{
